@@ -6,6 +6,8 @@ import cors from 'cors';
 import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
+import fs from 'fs';
+import { spawn } from 'child_process';
 
 const app = express();
 const httpServer = createServer(app);
@@ -25,8 +27,8 @@ const upload = multer({ dest: 'uploads/' });
 // In-memory store for builds
 const builds = new Map();
 
-// Simulated build process
-const startSimulatedBuild = (buildId: string, config: any) => {
+// Real build process
+const startBuildProcess = (buildId: string, config: any) => {
   const build = builds.get(buildId);
   if (!build) return;
 
@@ -49,39 +51,73 @@ const startSimulatedBuild = (buildId: string, config: any) => {
     io.to(buildId).emit('build-status', status);
   };
 
-  // Simulation steps
-  const steps = [
-    { msg: 'Initializing build environment...', time: 1000, progress: 5 },
-    { msg: `Pulling Docker image for ${config.projectType}...`, time: 2000, progress: 15 },
-    { msg: 'Cloning/Extracting source code...', time: 1500, progress: 25 },
-    { msg: 'Resolving dependencies...', time: 3000, progress: 40 },
-    { msg: `Running build command: ${config.projectType === 'gradle' ? './gradlew assembleRelease' : 'flutter build apk'}`, time: 1000, progress: 45 },
-    { msg: 'Compiling source code...', time: 4000, progress: 70 },
-    { msg: 'Running R8/ProGuard...', time: 2000, progress: 85 },
-    { msg: 'Signing APK/AAB...', time: 1500, progress: 95 },
-    { msg: 'Build completed successfully!', time: 1000, progress: 100, type: 'success' as const },
-  ];
+  const workDir = path.join(process.cwd(), 'builds', buildId);
+  
+  // Create builds directory if it doesn't exist
+  if (!fs.existsSync(path.join(process.cwd(), 'builds'))) {
+    fs.mkdirSync(path.join(process.cwd(), 'builds'), { recursive: true });
+  }
 
-  let currentStep = 0;
-
-  const runNextStep = () => {
-    if (currentStep >= steps.length) {
-      emitStatus('completed');
-      build.downloadUrl = `/api/download/${buildId}`;
-      io.to(buildId).emit('build-complete', { downloadUrl: build.downloadUrl });
+  // 1. Clone repo
+  emitLog(`Cloning repository: ${config.githubUrl}...`);
+  emitProgress(10);
+  
+  const gitClone = spawn('git', ['clone', config.githubUrl, workDir]);
+  
+  gitClone.stdout.on('data', (data) => emitLog(data.toString().trim()));
+  gitClone.stderr.on('data', (data) => emitLog(data.toString().trim()));
+  
+  gitClone.on('close', (code) => {
+    if (code !== 0) {
+      emitLog('Failed to clone repository', 'error');
+      emitStatus('failed');
       return;
     }
-
-    const step = steps[currentStep];
-    emitLog(step.msg, step.type || 'info');
-    emitProgress(step.progress);
-
-    currentStep++;
-    setTimeout(runNextStep, step.time);
-  };
-
-  // Start simulation
-  setTimeout(runNextStep, 500);
+    
+    emitLog('Repository cloned successfully.', 'success');
+    emitProgress(30);
+    
+    if (config.projectType === 'gradle') {
+      emitLog('Configuring Gradle memory limits to prevent Out of Memory (OOM) errors...');
+      const gradlePropsPath = path.join(workDir, 'gradle.properties');
+      let gradleProps = '';
+      if (fs.existsSync(gradlePropsPath)) {
+        gradleProps = fs.readFileSync(gradlePropsPath, 'utf-8');
+      }
+      if (!gradleProps.includes('org.gradle.jvmargs')) {
+        fs.appendFileSync(gradlePropsPath, '\norg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n');
+      }
+      
+      emitLog('Starting Gradle build (assembleDebug and bundleRelease)...');
+      emitProgress(40);
+      
+      // Make gradlew executable
+      if (fs.existsSync(path.join(workDir, 'gradlew'))) {
+        fs.chmodSync(path.join(workDir, 'gradlew'), '755');
+      }
+      
+      const buildProcess = spawn('./gradlew', ['assembleDebug', 'bundleRelease'], { cwd: workDir });
+      
+      buildProcess.stdout.on('data', (data) => emitLog(data.toString().trim()));
+      buildProcess.stderr.on('data', (data) => emitLog(data.toString().trim(), 'error'));
+      
+      buildProcess.on('close', (buildCode) => {
+        if (buildCode === 0) {
+          emitLog('Build completed successfully!', 'success');
+          emitProgress(100);
+          emitStatus('completed');
+          build.downloadUrl = `/api/download/${buildId}`;
+          io.to(buildId).emit('build-complete', { downloadUrl: build.downloadUrl });
+        } else {
+          emitLog(`Build failed with exit code ${buildCode}`, 'error');
+          emitStatus('failed');
+        }
+      });
+    } else {
+      emitLog('Only Gradle projects are fully implemented in this example.', 'error');
+      emitStatus('failed');
+    }
+  });
 };
 
 // API Routes
@@ -106,7 +142,7 @@ app.post('/api/build', upload.single('sourceFile'), (req, res) => {
   builds.set(buildId, buildConfig);
 
   // Start build asynchronously
-  setTimeout(() => startSimulatedBuild(buildId, buildConfig), 1000);
+  setTimeout(() => startBuildProcess(buildId, buildConfig), 1000);
 
   res.json({ buildId, status: 'queued' });
 });
@@ -137,10 +173,24 @@ app.get('/api/download/:id', (req, res) => {
   if (!build || build.status !== 'completed') {
     return res.status(404).send('File not found or build not complete');
   }
-  // Simulate file download
-  res.setHeader('Content-disposition', `attachment; filename=app-${build.buildType === 'apk' ? 'release.apk' : 'release.aab'}`);
-  res.setHeader('Content-type', 'application/vnd.android.package-archive');
-  res.send('Simulated APK/AAB binary content');
+  
+  const workDir = path.join(process.cwd(), 'builds', req.params.id);
+  let filePath = '';
+  
+  if (build.buildType === 'apk') {
+    filePath = path.join(workDir, 'app/build/outputs/apk/debug/app-debug.apk');
+  } else {
+    filePath = path.join(workDir, 'app/build/outputs/bundle/release/app-release.aab');
+  }
+  
+  if (fs.existsSync(filePath)) {
+    res.download(filePath);
+  } else {
+    // Fallback if file is missing
+    res.setHeader('Content-disposition', `attachment; filename=app-${build.buildType === 'apk' ? 'debug.apk' : 'release.aab'}`);
+    res.setHeader('Content-type', 'application/vnd.android.package-archive');
+    res.send('Build completed, but actual binary file was not found at ' + filePath);
+  }
 });
 
 // WebSocket connection handling
