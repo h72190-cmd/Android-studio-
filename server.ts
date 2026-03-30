@@ -85,7 +85,7 @@ const startBuildProcess = (buildId: string, config: any) => {
         gradleProps = fs.readFileSync(gradlePropsPath, 'utf-8');
       }
       if (!gradleProps.includes('org.gradle.jvmargs')) {
-        fs.appendFileSync(gradlePropsPath, '\norg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n');
+        fs.appendFileSync(gradlePropsPath, '\norg.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8\n');
       }
       
       emitLog('Starting Gradle build (assembleDebug and bundleRelease)...');
@@ -94,10 +94,19 @@ const startBuildProcess = (buildId: string, config: any) => {
       // Make gradlew executable
       if (fs.existsSync(path.join(workDir, 'gradlew'))) {
         fs.chmodSync(path.join(workDir, 'gradlew'), '755');
+      } else {
+        emitLog('Error: gradlew file not found in the repository root. Is this a valid Android project?', 'error');
+        emitStatus('failed');
+        return;
       }
       
-      const buildProcess = spawn('./gradlew', ['assembleDebug', 'bundleRelease'], { cwd: workDir });
+      const buildProcess = spawn('./gradlew', ['assembleDebug', 'bundleRelease', '--no-daemon', '--max-workers=2'], { cwd: workDir });
       
+      buildProcess.on('error', (err) => {
+        emitLog(`Failed to start build process: ${err.message}`, 'error');
+        emitStatus('failed');
+      });
+
       buildProcess.stdout.on('data', (data) => emitLog(data.toString().trim()));
       buildProcess.stderr.on('data', (data) => emitLog(data.toString().trim(), 'error'));
       
